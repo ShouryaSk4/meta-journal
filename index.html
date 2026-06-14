@@ -188,9 +188,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
 .voice-lang { background: var(--bg2); border: 1px solid var(--line); color: var(--muted); font-family: var(--mono); font-size: 9px; padding: 5px 8px; cursor: pointer; }
 .voice-live { min-height: 0; font-size: 12px; font-style: italic; color: var(--muted); margin-top: 10px; line-height: 1.55; }
 .voice-live:not(:empty) { min-height: 20px; }
-.voice-meter { display: none; align-items: flex-end; gap: 3px; height: 20px; margin-top: 10px; }
-.voice-meter.active { display: flex; }
-.voice-meter span { flex: 1; background: var(--line2); height: 4px; transition: height 0.08s ease; }
+.voice-meter { display: none; }
 #voice-transcript { min-height: 88px; font-size: 12px; line-height: 1.55; margin-top: 10px; }
 .voice-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 12px; }
 .voice-btn {
@@ -224,7 +222,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
       <span class="voice-label">Voice log</span>
       <span class="voice-model" id="voice-model">parse · gemini-3.1-flash-lite</span>
     </div>
-    <span class="voice-status" id="voice-status">Tap record and talk through your whole day in one go.</span>
+    <span class="voice-status" id="voice-status">Record, then check the text box below has your words before Process.</span>
     <div class="voice-meta">
       <span id="voice-timer">00:00</span>
       <select id="voice-lang" class="voice-lang" title="Speech recognition language">
@@ -234,8 +232,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
       </select>
     </div>
     <div id="voice-live" class="voice-live" aria-live="polite"></div>
-    <div class="voice-meter" id="voice-meter" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
-    <textarea id="voice-transcript" placeholder="Final transcript builds here… or type / paste your day instead."></textarea>
+    <textarea id="voice-transcript" placeholder="Your words appear here as you speak — or type / paste. Must have text here before Process."></textarea>
     <div class="voice-actions">
       <button type="button" class="voice-btn" id="voice-mic-btn" onclick="toggleVoice()">◉ Record</button>
       <button type="button" class="voice-btn voice-btn-primary" id="voice-parse-btn" onclick="parseVoice()">→ Process</button>
@@ -425,10 +422,11 @@ var _recognition = null;
 var _listening = false;
 var _voiceFinal = '';
 var _voiceTimerIv = null;
-var _voiceMeterIv = null;
-var _audioCtx = null;
-var _analyser = null;
+var _voiceMode = 'speech'; // 'speech' | 'audio'
+var _mediaRecorder = null;
 var _mediaStream = null;
+var _audioChunks = [];
+var _recordedAudio = null;
 
 function setVoiceStatus(msg){ document.getElementById('voice-status').textContent = msg; }
 
@@ -437,11 +435,38 @@ function speechSupported(){
 }
 
 function bestTranscript(result){
+  if(!result || !result.length) return '';
   var best = result[0];
   for(var j = 1; j < result.length; j++){
-    if(result[j].confidence > best.confidence) best = result[j];
+    var c = result[j].confidence || 0;
+    var bc = best.confidence || 0;
+    if(c > bc) best = result[j];
   }
-  return best.transcript;
+  return best.transcript || '';
+}
+
+function syncTranscriptUI(interim){
+  var box = document.getElementById('voice-transcript');
+  var text = (_voiceFinal + (interim || '')).trim();
+  box.value = text;
+}
+
+function flushInterimToFinal(){
+  var live = document.getElementById('voice-live').textContent.trim();
+  if(live){
+    _voiceFinal += live;
+    if(!/[.!?]$/.test(live.trim())) _voiceFinal += '. ';
+    else _voiceFinal += ' ';
+  }
+  document.getElementById('voice-live').textContent = '';
+  syncTranscriptUI('');
+}
+
+function getVoiceText(){
+  flushInterimToFinal();
+  var t = document.getElementById('voice-transcript').value.trim();
+  if(t) return t;
+  return document.getElementById('voice-live').textContent.trim();
 }
 
 function initSpeech(){
@@ -457,6 +482,7 @@ function initSpeech(){
     for(var i = ev.resultIndex; i < ev.results.length; i++){
       var result = ev.results[i];
       var t = bestTranscript(result);
+      if(!t) continue;
       if(result.isFinal){
         _voiceFinal += t;
         if(!/[.!?]$/.test(t.trim())) _voiceFinal += '. ';
@@ -464,59 +490,36 @@ function initSpeech(){
       } else interim += t;
     }
     document.getElementById('voice-live').textContent = interim;
-    document.getElementById('voice-transcript').value = _voiceFinal.trim();
+    syncTranscriptUI(interim);
   };
   r.onerror = function(ev){
     console.error('Speech error:', ev.error);
-    if(ev.error === 'not-allowed') setVoiceStatus('Microphone blocked — allow mic access or type below.');
-    else if(ev.error === 'no-speech') setVoiceStatus('No speech heard — try again closer to the mic.');
-    else if(ev.error !== 'aborted') setVoiceStatus('Speech error: ' + ev.error);
-    if(ev.error !== 'aborted') stopVoice();
+    if(ev.error === 'not-allowed'){
+      setVoiceStatus('Microphone blocked — allow mic in browser settings.');
+      stopVoice();
+    } else if(ev.error === 'no-speech'){
+      setVoiceStatus('Still listening… speak clearly into the mic.');
+    } else if(ev.error !== 'aborted'){
+      setVoiceStatus('Speech error: ' + ev.error);
+      stopVoice();
+    }
   };
   r.onend = function(){
-    if(_listening){
+    if(_listening && _voiceMode === 'speech'){
       setTimeout(function(){
         if(_listening) try{ r.start(); }catch(e){}
-      }, 250);
+      }, 300);
     }
   };
   return r;
 }
 
-function startVoiceMeter(){
-  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
-  navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
-    .then(function(stream){
-      _mediaStream = stream;
-      _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      var src = _audioCtx.createMediaStreamSource(stream);
-      _analyser = _audioCtx.createAnalyser();
-      _analyser.fftSize = 64;
-      src.connect(_analyser);
-      var bars = document.querySelectorAll('#voice-meter span');
-      var data = new Uint8Array(_analyser.frequencyBinCount);
-      document.getElementById('voice-meter').classList.add('active');
-      _voiceMeterIv = setInterval(function(){
-        if(!_analyser) return;
-        _analyser.getByteFrequencyData(data);
-        for(var i = 0; i < bars.length; i++){
-          var idx = Math.floor(i * data.length / bars.length);
-          var h = Math.max(4, Math.round((data[idx] / 255) * 18));
-          bars[i].style.height = h + 'px';
-        }
-      }, 80);
-    })
-    .catch(function(){ /* meter is optional */ });
-}
-
-function stopVoiceMeter(){
-  clearInterval(_voiceMeterIv);
-  document.getElementById('voice-meter').classList.remove('active');
-  document.querySelectorAll('#voice-meter span').forEach(function(b){ b.style.height = '4px'; });
-  if(_mediaStream) _mediaStream.getTracks().forEach(function(t){ t.stop(); });
-  _mediaStream = null;
-  if(_audioCtx){ _audioCtx.close(); _audioCtx = null; }
-  _analyser = null;
+function pickAudioMime(){
+  var types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
+  for(var i = 0; i < types.length; i++){
+    if(MediaRecorder.isTypeSupported(types[i])) return types[i];
+  }
+  return '';
 }
 
 function startVoiceTimer(){
@@ -534,53 +537,138 @@ function stopVoiceTimer(){
   clearInterval(_voiceTimerIv);
 }
 
-function toggleVoice(){
-  if(_listening) stopVoice();
-  else startVoice();
+function setRecordingUI(on){
+  var btn = document.getElementById('voice-mic-btn');
+  if(on){
+    btn.textContent = '■ Stop';
+    btn.classList.add('listening');
+    document.getElementById('voice-lang').disabled = true;
+  } else {
+    btn.textContent = '◉ Record';
+    btn.classList.remove('listening');
+    document.getElementById('voice-lang').disabled = false;
+  }
 }
 
-function startVoice(){
-  if(!speechSupported()){
-    setVoiceStatus('Speech not supported in this browser — type or paste instead.');
-    toast('Use Chrome or Edge for voice');
-    return;
-  }
+function startSpeechRecognition(){
+  _voiceMode = 'speech';
+  _recordedAudio = null;
   _recognition = initSpeech();
   _voiceFinal = document.getElementById('voice-transcript').value.trim();
   if(_voiceFinal) _voiceFinal += ' ';
   document.getElementById('voice-live').textContent = '';
   _listening = true;
-  var btn = document.getElementById('voice-mic-btn');
-  btn.textContent = '■ Stop';
-  btn.classList.add('listening');
-  document.getElementById('voice-lang').disabled = true;
-  setVoiceStatus('Listening… health, sleep, work scores, wins, mistakes, day score.');
+  setRecordingUI(true);
+  setVoiceStatus('Listening… words should appear in the box below.');
   startVoiceTimer();
-  startVoiceMeter();
-  try{ _recognition.start(); }catch(e){}
+  try{ _recognition.start(); }catch(e){
+    console.error(e);
+    setVoiceStatus('Could not start mic — trying audio record mode…');
+    stopVoice();
+    startAudioRecording();
+  }
 }
 
-function stopVoice(){
-  _listening = false;
+async function startAudioRecording(){
+  if(!navigator.mediaDevices || !window.MediaRecorder){
+    setVoiceStatus('Voice not supported here — type in the box below.');
+    toast('Type or paste your day below');
+    return;
+  }
+  try{
+    _voiceMode = 'audio';
+    _recordedAudio = null;
+    _audioChunks = [];
+    _mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    var mime = pickAudioMime();
+    var opts = mime ? { mimeType: mime } : undefined;
+    _mediaRecorder = new MediaRecorder(_mediaStream, opts);
+    _mediaRecorder.ondataavailable = function(e){ if(e.data && e.data.size) _audioChunks.push(e.data); };
+    _mediaRecorder.start(300);
+    _listening = true;
+    setRecordingUI(true);
+    setVoiceStatus('Recording audio… tap Stop, then Process (works on iPhone).');
+    startVoiceTimer();
+  }catch(e){
+    console.error(e);
+    setVoiceStatus('Microphone blocked — allow access or type below.');
+    toast('Allow microphone or type below');
+  }
+}
+
+function stopSpeechRecognition(){
+  flushInterimToFinal();
   if(_recognition) try{ _recognition.stop(); }catch(e){}
+  _recognition = null;
+}
+
+function stopAudioRecording(){
+  return new Promise(function(resolve){
+    if(!_mediaRecorder || _mediaRecorder.state === 'inactive'){
+      resolve();
+      return;
+    }
+    _mediaRecorder.onstop = function(){
+      var mime = _mediaRecorder.mimeType || 'audio/webm';
+      var blob = new Blob(_audioChunks, { type: mime });
+      if(blob.size < 100){
+        resolve();
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function(){
+        var parts = reader.result.split(',');
+        _recordedAudio = { base64: parts[1], mime: mime };
+        document.getElementById('voice-transcript').value = '[Audio recorded — tap Process to transcribe with Gemini]';
+        resolve();
+      };
+      reader.readAsDataURL(blob);
+    };
+    try{ _mediaRecorder.stop(); }catch(e){ resolve(); }
+    if(_mediaStream) _mediaStream.getTracks().forEach(function(t){ t.stop(); });
+    _mediaStream = null;
+  });
+}
+
+function startVoice(){
+  _recordedAudio = null;
+  if(speechSupported()) startSpeechRecognition();
+  else startAudioRecording();
+}
+
+async function stopVoice(){
+  if(!_listening) return;
+  _listening = false;
   stopVoiceTimer();
-  stopVoiceMeter();
-  document.getElementById('voice-live').textContent = '';
-  document.getElementById('voice-lang').disabled = false;
-  var btn = document.getElementById('voice-mic-btn');
-  btn.textContent = '◉ Record';
-  btn.classList.remove('listening');
-  setVoiceStatus('Stopped. Tap Process to fill the form.');
+  if(_voiceMode === 'audio') await stopAudioRecording();
+  else stopSpeechRecognition();
+  setRecordingUI(false);
+  if(_voiceMode === 'audio' && _recordedAudio){
+    setVoiceStatus('Audio saved. Tap Process — Gemini will transcribe and fill the form.');
+  } else {
+    setVoiceStatus('Stopped. Check the text box, then tap Process.');
+  }
+}
+
+async function toggleVoice(){
+  if(_listening) await stopVoice();
+  else startVoice();
 }
 
 function clearVoice(){
   if(_listening) stopVoice();
   _voiceFinal = '';
+  _recordedAudio = null;
+  _audioChunks = [];
   document.getElementById('voice-transcript').value = '';
   document.getElementById('voice-live').textContent = '';
   document.getElementById('voice-timer').textContent = '00:00';
   setVoiceStatus('Transcript cleared.');
 }
+
+document.getElementById('voice-transcript').addEventListener('input', function(){
+  if(!_listening || _voiceMode === 'audio') _voiceFinal = this.value;
+});
 
 function clampScore(v, half){
   var n = parseFloat(v);
@@ -617,17 +705,30 @@ function applyParsedEntry(d){
 }
 
 async function parseVoice(){
-  if(_listening) stopVoice();
-  var text = document.getElementById('voice-transcript').value.trim();
-  if(!text){ toast('Say or type something first'); return; }
+  if(_listening) await stopVoice();
+
+  var text = getVoiceText();
+  var body = null;
+
+  if(_recordedAudio && _recordedAudio.base64){
+    body = { audio: _recordedAudio.base64, audioMime: _recordedAudio.mime };
+    setVoiceStatus('Sending audio to ' + GEMINI_PARSE_MODEL + '…');
+  } else if(text && text.indexOf('[Audio recorded') === -1){
+    body = { transcript: text };
+  } else {
+    toast('Say, record, or type something first');
+    setVoiceStatus('Nothing to process — record or type in the box first.');
+    return;
+  }
+
   var btn = document.getElementById('voice-parse-btn');
   btn.disabled = true;
-  setVoiceStatus('Processing with ' + GEMINI_PARSE_MODEL + '…');
+  if(!body.audio) setVoiceStatus('Processing with ' + GEMINI_PARSE_MODEL + '…');
   try{
     var res = await fetch('/api/parse-log', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcript: text })
+      body: JSON.stringify(body)
     });
     var json = await res.json();
     if(!res.ok) throw new Error(json.error || 'Process failed');
