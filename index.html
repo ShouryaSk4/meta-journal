@@ -182,6 +182,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
 /* VOICE */
 .voice-sec { border: 1px solid var(--line); padding: 16px; margin-bottom: 28px; }
 .voice-label { font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.voice-model { font-family: var(--mono); font-size: 8px; letter-spacing: 0.12em; color: var(--muted2); text-transform: lowercase; }
 .voice-status { display: block; font-size: 11px; color: var(--muted2); margin-top: 8px; line-height: 1.4; }
 .voice-meta { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-family: var(--mono); font-size: 9px; color: var(--muted2); letter-spacing: 0.12em; }
 .voice-lang { background: var(--bg2); border: 1px solid var(--line); color: var(--muted); font-family: var(--mono); font-size: 9px; padding: 5px 8px; cursor: pointer; }
@@ -219,7 +220,10 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
   <div class="log-header"><h1>Daily Log</h1><p>Fill once. Fill honestly.</p></div>
 
   <div class="voice-sec" id="voice-sec">
-    <span class="voice-label">Voice log</span>
+    <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">
+      <span class="voice-label">Voice log</span>
+      <span class="voice-model" id="voice-model">parse · gemini-3.1-flash-lite</span>
+    </div>
     <span class="voice-status" id="voice-status">Tap record and talk through your whole day in one go.</span>
     <div class="voice-meta">
       <span id="voice-timer">00:00</span>
@@ -362,6 +366,9 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
 var SUPABASE_URL = 'https://ntepzsbzpnrpbmyatzmm.supabase.co';
 var SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im50ZXB6c2J6cG5ycGJteWF0em1tIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk2OTk5NzEsImV4cCI6MjA5NTI3NTk3MX0.hafEL__CbEbVHeVxPrLAP-jVxpuofUdWf43ytG5c1vQ';
 var sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/* ─────────── Gemini parse model (must match api/parse-log.js + GEMINI_MODEL env) ─────────── */
+var GEMINI_PARSE_MODEL = 'gemini-3.1-flash-lite';
 var _cache = [];
 var _loaded = false;
 
@@ -615,7 +622,7 @@ async function parseVoice(){
   if(!text){ toast('Say or type something first'); return; }
   var btn = document.getElementById('voice-parse-btn');
   btn.disabled = true;
-  setVoiceStatus('Processing with Gemini…');
+  setVoiceStatus('Processing with ' + GEMINI_PARSE_MODEL + '…');
   try{
     var res = await fetch('/api/parse-log', {
       method: 'POST',
@@ -625,8 +632,10 @@ async function parseVoice(){
     var json = await res.json();
     if(!res.ok) throw new Error(json.error || 'Process failed');
     applyParsedEntry(json.data);
+    var usedModel = json.model || GEMINI_PARSE_MODEL;
+    document.getElementById('voice-model').textContent = 'parse · ' + usedModel;
     toast('Form filled — review and commit.');
-    setVoiceStatus('Done. Scroll down, tweak anything, then commit.');
+    setVoiceStatus('Done (' + usedModel + '). Scroll down, tweak, then commit.');
   }catch(err){
     console.error(err);
     var msg = err.message || 'Process failed';
