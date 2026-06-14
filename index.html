@@ -188,6 +188,19 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
 .voice-lang { background: var(--bg2); border: 1px solid var(--line); color: var(--muted); font-family: var(--mono); font-size: 9px; padding: 5px 8px; cursor: pointer; }
 .voice-live { min-height: 0; font-size: 12px; font-style: italic; color: var(--muted); margin-top: 10px; line-height: 1.55; }
 .voice-live:not(:empty) { min-height: 20px; }
+.voice-feed {
+  margin-top: 10px; max-height: 100px; overflow-y: auto;
+  border: 1px solid var(--line); padding: 8px 10px;
+  font-family: var(--mono); font-size: 9px; line-height: 1.55;
+  color: var(--muted2);
+}
+.voice-feed:empty { display: none; }
+.vf { margin-bottom: 4px; }
+.vf span { color: var(--muted); margin-right: 6px; }
+.vf.interim { color: var(--muted); font-style: italic; }
+.vf.final { color: var(--text); }
+.vf.turn { color: var(--muted2); }
+.vf.err { color: #c44; }
 .voice-meter { display: none; }
 #voice-transcript { min-height: 88px; font-size: 12px; line-height: 1.55; margin-top: 10px; }
 .voice-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 12px; }
@@ -222,17 +235,22 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
       <span class="voice-label">Voice log</span>
       <span class="voice-model" id="voice-model">parse · gemini-3.1-flash-lite</span>
     </div>
-    <span class="voice-status" id="voice-status">Record, then check the text box below has your words before Process.</span>
+    <span class="voice-status" id="voice-status">Pause anytime — your full dump stays. Stop when done, then Process.</span>
     <div class="voice-meta">
       <span id="voice-timer">00:00</span>
-      <select id="voice-lang" class="voice-lang" title="Speech recognition language">
+      <select id="voice-stt-mode" class="voice-lang" title="Speech-to-text engine">
+        <option value="gemini-live" selected>Gemini Live STT</option>
+        <option value="browser">Browser speech</option>
+      </select>
+      <select id="voice-lang" class="voice-lang" title="Browser speech language only">
         <option value="en-IN" selected>English (India)</option>
         <option value="en-US">English (US)</option>
         <option value="en-GB">English (UK)</option>
       </select>
     </div>
     <div id="voice-live" class="voice-live" aria-live="polite"></div>
-    <textarea id="voice-transcript" placeholder="Your words appear here as you speak — or type / paste. Must have text here before Process."></textarea>
+    <div id="voice-feed" class="voice-feed" aria-live="polite"></div>
+    <textarea id="voice-transcript" placeholder="Live transcript builds here as you speak… or type / paste."></textarea>
     <div class="voice-actions">
       <button type="button" class="voice-btn" id="voice-mic-btn" onclick="toggleVoice()">◉ Record</button>
       <button type="button" class="voice-btn voice-btn-primary" id="voice-parse-btn" onclick="parseVoice()">→ Process</button>
@@ -366,6 +384,8 @@ var sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 /* ─────────── Gemini parse model (must match api/parse-log.js + GEMINI_MODEL env) ─────────── */
 var GEMINI_PARSE_MODEL = 'gemini-3.1-flash-lite';
+/* ─────────── Gemini Live STT (local dev server scripts/live-stt-server.mjs) ─────────── */
+var GEMINI_LIVE_MODEL = 'gemini-3.5-live-translate-preview';
 var _cache = [];
 var _loaded = false;
 
@@ -385,8 +405,30 @@ var QQ = [
 ];
 function rq(){ var q=QQ[Math.floor(Math.random()*QQ.length)]; return '\u201c'+q[0]+'\u201d<br><small style="font-size:8px;letter-spacing:0.18em;font-family:var(--mono);font-style:normal;color:var(--muted)">— '+q[1]+'</small>'; }
 function sv(k,v){ sc[k]=parseFloat(v); var e=document.getElementById('v-'+k); if(e) e.textContent=parseFloat(v)%1===0?parseInt(v):parseFloat(v).toFixed(1); }
+function findSlider(k){
+  var label = document.getElementById('v-'+k);
+  if(!label) return null;
+  var row = label.closest('.srow');
+  return row ? row.querySelector('input[type=range]') : null;
+}
 function gl(){ return _cache; }
-function toast(m){ var t=document.getElementById('toast'); t.textContent=m; t.classList.add('show'); setTimeout(function(){ t.classList.remove('show'); },2200); }
+function toast(m){ var t=document.getElementById('toast'); t.textContent=m; t.classList.add('show'); setTimeout(function(){ t.classList.remove('show'); }, m.length > 40 ? 4500 : 2200); }
+
+function supabaseErrorMsg(err, action){
+  if(!err) return action + ' failed';
+  var msg = err.message || action + ' failed';
+  var code = err.code || '';
+  if(code === 'PGRST205' || /Could not find the table/i.test(msg)){
+    return 'Table missing — run supabase_schema.sql in Supabase';
+  }
+  if(code === '42501' || /permission denied/i.test(msg)){
+    return 'DB permission — run supabase_fix_grants.sql in Supabase';
+  }
+  if(/JWT|Invalid API key/i.test(msg)){
+    return 'Bad Supabase key — update anon key in index.html';
+  }
+  return msg.length > 72 ? msg.slice(0, 69) + '…' : msg;
+}
 
 function rowToEntry(r){
   return {
@@ -402,9 +444,14 @@ function rowToEntry(r){
 
 async function loadAll(){
   var res = await sb.from('journal_entries').select('*').order('entry_date', { ascending: false });
-  if(res.error){ console.error(res.error); toast('Load failed'); return; }
+  if(res.error){
+    console.error('Supabase load error:', res.error);
+    toast(supabaseErrorMsg(res.error, 'Load'));
+    return false;
+  }
   _cache = (res.data || []).map(rowToEntry);
   _loaded = true;
+  return true;
 }
 
 function isoToDisplay(iso){
@@ -420,15 +467,70 @@ function strOrNull(id){ var v=document.getElementById(id).value; return v===''?n
 /* ── VOICE LOG ── */
 var _recognition = null;
 var _listening = false;
-var _voiceFinal = '';
+var _voiceCommitted = ''; // locked-in text (survives pauses)
+var _voicePending = '';   // current phrase while you speak
 var _voiceTimerIv = null;
-var _voiceMode = 'speech'; // 'speech' | 'audio'
+var _voiceMode = 'speech'; // 'speech' | 'audio' | 'gemini-live'
 var _mediaRecorder = null;
 var _mediaStream = null;
 var _audioChunks = [];
 var _recordedAudio = null;
+var _liveWs = null;
+var _liveAudioCtx = null;
+var _liveProcessor = null;
+
+function getLiveSttWsUrl(){
+  if(location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') return null;
+  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return proto + '//' + location.host + '/live-stt';
+}
+
+function canUseGeminiLive(){
+  return !!getLiveSttWsUrl();
+}
+
+function downsampleFloat32(buffer, fromRate, toRate){
+  if(fromRate === toRate) return buffer;
+  var ratio = fromRate / toRate;
+  var newLen = Math.floor(buffer.length / ratio);
+  var out = new Float32Array(newLen);
+  for(var i = 0; i < newLen; i++) out[i] = buffer[Math.floor(i * ratio)];
+  return out;
+}
+
+function floatTo16BitPCM(float32){
+  var out = new Int16Array(float32.length);
+  for(var i = 0; i < float32.length; i++){
+    var s = Math.max(-1, Math.min(1, float32[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+function arrayBufferToBase64(buffer){
+  var bytes = new Uint8Array(buffer);
+  var bin = '';
+  for(var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
 
 function setVoiceStatus(msg){ document.getElementById('voice-status').textContent = msg; }
+
+function pushVoiceFeed(line, kind){
+  var feed = document.getElementById('voice-feed');
+  if(!feed || !line) return;
+  var ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  var row = document.createElement('div');
+  row.className = 'vf ' + (kind || '');
+  row.innerHTML = '<span>' + ts + '</span>' + line;
+  feed.insertBefore(row, feed.firstChild);
+  while(feed.childNodes.length > 40) feed.removeChild(feed.lastChild);
+}
+
+function clearVoiceFeed(){
+  var feed = document.getElementById('voice-feed');
+  if(feed) feed.innerHTML = '';
+}
 
 function speechSupported(){
   return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
@@ -445,28 +547,71 @@ function bestTranscript(result){
   return best.transcript || '';
 }
 
-function syncTranscriptUI(interim){
-  var box = document.getElementById('voice-transcript');
-  var text = (_voiceFinal + (interim || '')).trim();
-  box.value = text;
+function appendCommittedSegment(seg){
+  seg = (seg || '').trim();
+  if(!seg) return;
+  var c = _voiceCommitted.trim();
+  if(!c){
+    _voiceCommitted = seg;
+    return;
+  }
+  if(c.endsWith(seg)) return;
+  if(c.indexOf(seg) >= 0 && c.length >= seg.length) return;
+  if(seg.indexOf(c) === 0 && seg.length > c.length){
+    _voiceCommitted = seg;
+    return;
+  }
+  if(!/[.!?]$/.test(c)) _voiceCommitted = c + '. ' + seg;
+  else _voiceCommitted = c + ' ' + seg;
 }
 
-function flushInterimToFinal(){
-  var live = document.getElementById('voice-live').textContent.trim();
-  if(live){
-    _voiceFinal += live;
-    if(!/[.!?]$/.test(live.trim())) _voiceFinal += '. ';
-    else _voiceFinal += ' ';
+function refreshTranscriptBox(){
+  var show = _voiceCommitted.trim();
+  var pending = _voicePending.trim();
+  if(pending) show = show ? show + ' ' + pending : pending;
+  document.getElementById('voice-transcript').value = show;
+  document.getElementById('voice-live').textContent = pending;
+}
+
+function commitPendingUtterance(finalText){
+  var seg = (finalText || _voicePending || '').trim();
+  if(!seg){ _voicePending = ''; refreshTranscriptBox(); return; }
+  var c = _voiceCommitted.trim();
+  if(c && seg.indexOf(c) === 0 && seg.length > c.length){
+    _voiceCommitted = seg;
+  } else {
+    appendCommittedSegment(seg);
   }
-  document.getElementById('voice-live').textContent = '';
-  syncTranscriptUI('');
+  _voicePending = '';
+  refreshTranscriptBox();
+}
+
+function initVoiceTranscriptFromBox(){
+  _voiceCommitted = document.getElementById('voice-transcript').value.trim();
+  _voicePending = '';
+  refreshTranscriptBox();
+}
+
+function flushPendingToCommitted(){
+  if(_voicePending.trim()) commitPendingUtterance(_voicePending);
 }
 
 function getVoiceText(){
-  flushInterimToFinal();
-  var t = document.getElementById('voice-transcript').value.trim();
-  if(t) return t;
-  return document.getElementById('voice-live').textContent.trim();
+  flushPendingToCommitted();
+  return document.getElementById('voice-transcript').value.trim();
+}
+
+function handleTranscriptUpdate(text, finished){
+  text = (text || '').trim();
+  if(!text && !finished) return;
+  if(finished){
+    commitPendingUtterance(text);
+  } else {
+    var c = _voiceCommitted.trim();
+    if(c && text.indexOf(c) === 0) _voicePending = text.slice(c.length).trim();
+    else _voicePending = text;
+    refreshTranscriptBox();
+  }
 }
 
 function initSpeech(){
@@ -483,14 +628,11 @@ function initSpeech(){
       var result = ev.results[i];
       var t = bestTranscript(result);
       if(!t) continue;
-      if(result.isFinal){
-        _voiceFinal += t;
-        if(!/[.!?]$/.test(t.trim())) _voiceFinal += '. ';
-        else _voiceFinal += ' ';
-      } else interim += t;
+      if(result.isFinal) appendCommittedSegment(t);
+      else interim += t;
     }
-    document.getElementById('voice-live').textContent = interim;
-    syncTranscriptUI(interim);
+    _voicePending = interim.trim();
+    refreshTranscriptBox();
   };
   r.onerror = function(ev){
     console.error('Speech error:', ev.error);
@@ -539,24 +681,126 @@ function stopVoiceTimer(){
 
 function setRecordingUI(on){
   var btn = document.getElementById('voice-mic-btn');
+  var sttSel = document.getElementById('voice-stt-mode');
   if(on){
     btn.textContent = '■ Stop';
     btn.classList.add('listening');
     document.getElementById('voice-lang').disabled = true;
+    if(sttSel) sttSel.disabled = true;
   } else {
     btn.textContent = '◉ Record';
     btn.classList.remove('listening');
     document.getElementById('voice-lang').disabled = false;
+    if(sttSel) sttSel.disabled = false;
   }
+}
+
+async function startGeminiLiveMic(){
+  _mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  _liveAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  var source = _liveAudioCtx.createMediaStreamSource(_mediaStream);
+  _liveProcessor = _liveAudioCtx.createScriptProcessor(4096, 1, 1);
+  source.connect(_liveProcessor);
+  _liveProcessor.connect(_liveAudioCtx.destination);
+  var rate = _liveAudioCtx.sampleRate;
+  _liveProcessor.onaudioprocess = function(e){
+    if(!_listening || !_liveWs || _liveWs.readyState !== 1) return;
+    var input = e.inputBuffer.getChannelData(0);
+    if(rate !== 16000) input = downsampleFloat32(input, rate, 16000);
+    var pcm = floatTo16BitPCM(input);
+    _liveWs.send(JSON.stringify({ type: 'audio', data: arrayBufferToBase64(pcm.buffer) }));
+  };
+}
+
+function startGeminiLive(){
+  var wsUrl = getLiveSttWsUrl();
+  if(!wsUrl){
+    toast('Gemini Live only on localhost — run npm run dev');
+    setVoiceStatus('Run npm run dev, open http://localhost:3000');
+    return;
+  }
+  _voiceMode = 'gemini-live';
+  _recordedAudio = null;
+  clearVoiceFeed();
+  initVoiceTranscriptFromBox();
+  document.getElementById('voice-model').textContent = 'stt · ' + GEMINI_LIVE_MODEL;
+  _listening = true;
+  setRecordingUI(true);
+  startVoiceTimer();
+  setVoiceStatus('Connecting to Gemini Live…');
+
+  _liveWs = new WebSocket(wsUrl);
+  _liveWs.onopen = function(){ /* wait for ready */ };
+  _liveWs.onmessage = function(ev){
+    var msg = JSON.parse(ev.data);
+    if(msg.type === 'ready'){
+      startGeminiLiveMic().then(function(){
+        if(_voiceCommitted.trim() && _liveWs && _liveWs.readyState === 1){
+          _liveWs.send(JSON.stringify({ type: 'prefix', text: _voiceCommitted.trim() }));
+        }
+        setVoiceStatus('Gemini Live listening — pause anytime, full dump stays.');
+      }).catch(function(err){
+        console.error(err);
+        setVoiceStatus('Mic blocked — allow microphone access.');
+        stopVoice();
+      });
+      return;
+    }
+    if(msg.type === 'transcript'){
+      if(msg.display){
+        var display = msg.display.trim();
+        document.getElementById('voice-transcript').value = display;
+        _voiceCommitted = display;
+        _voicePending = (msg.utterance || '').trim();
+        document.getElementById('voice-live').textContent = _voicePending;
+        if(msg.chunk){
+          if(msg.finished || msg.turnComplete) pushVoiceFeed(msg.chunk, 'final');
+          else pushVoiceFeed(msg.chunk, 'interim');
+        }
+        if(msg.turnComplete) pushVoiceFeed('— pause / turn —', 'turn');
+      } else if(msg.text){
+        handleTranscriptUpdate(msg.text, msg.finished);
+      }
+    }
+    if(msg.type === 'error'){
+      pushVoiceFeed(msg.message, 'err');
+      setVoiceStatus('Gemini Live: ' + msg.message);
+      toast(msg.message);
+      stopVoice();
+    }
+  };
+  _liveWs.onerror = function(){
+    setVoiceStatus('WebSocket failed — is npm run dev running?');
+    stopVoice();
+  };
+  _liveWs.onclose = function(){
+    if(_listening) setVoiceStatus('Gemini Live disconnected.');
+  };
+}
+
+function stopGeminiLive(){
+  flushPendingToCommitted();
+  if(_liveProcessor){
+    _liveProcessor.disconnect();
+    _liveProcessor.onaudioprocess = null;
+    _liveProcessor = null;
+  }
+  if(_liveAudioCtx){ _liveAudioCtx.close(); _liveAudioCtx = null; }
+  if(_mediaStream) _mediaStream.getTracks().forEach(function(t){ t.stop(); });
+  _mediaStream = null;
+  if(_liveWs){
+    try{ _liveWs.send(JSON.stringify({ type: 'stop' })); }catch(e){}
+    try{ _liveWs.close(); }catch(e){}
+    _liveWs = null;
+  }
+  document.getElementById('voice-model').textContent = 'parse · ' + GEMINI_PARSE_MODEL;
 }
 
 function startSpeechRecognition(){
   _voiceMode = 'speech';
   _recordedAudio = null;
   _recognition = initSpeech();
-  _voiceFinal = document.getElementById('voice-transcript').value.trim();
-  if(_voiceFinal) _voiceFinal += ' ';
-  document.getElementById('voice-live').textContent = '';
+  initVoiceTranscriptFromBox();
   _listening = true;
   setRecordingUI(true);
   setVoiceStatus('Listening… words should appear in the box below.');
@@ -597,7 +841,7 @@ async function startAudioRecording(){
 }
 
 function stopSpeechRecognition(){
-  flushInterimToFinal();
+  flushPendingToCommitted();
   if(_recognition) try{ _recognition.stop(); }catch(e){}
   _recognition = null;
 }
@@ -632,7 +876,11 @@ function stopAudioRecording(){
 
 function startVoice(){
   _recordedAudio = null;
-  if(speechSupported()) startSpeechRecognition();
+  var sttMode = document.getElementById('voice-stt-mode').value;
+  if(sttMode === 'gemini-live' && canUseGeminiLive()) startGeminiLive();
+  else if(sttMode === 'browser' && speechSupported()) startSpeechRecognition();
+  else if(canUseGeminiLive()) startGeminiLive();
+  else if(speechSupported()) startSpeechRecognition();
   else startAudioRecording();
 }
 
@@ -640,7 +888,8 @@ async function stopVoice(){
   if(!_listening) return;
   _listening = false;
   stopVoiceTimer();
-  if(_voiceMode === 'audio') await stopAudioRecording();
+  if(_voiceMode === 'gemini-live') stopGeminiLive();
+  else if(_voiceMode === 'audio') await stopAudioRecording();
   else stopSpeechRecognition();
   setRecordingUI(false);
   if(_voiceMode === 'audio' && _recordedAudio){
@@ -657,9 +906,11 @@ async function toggleVoice(){
 
 function clearVoice(){
   if(_listening) stopVoice();
-  _voiceFinal = '';
+  _voiceCommitted = '';
+  _voicePending = '';
   _recordedAudio = null;
   _audioChunks = [];
+  clearVoiceFeed();
   document.getElementById('voice-transcript').value = '';
   document.getElementById('voice-live').textContent = '';
   document.getElementById('voice-timer').textContent = '00:00';
@@ -667,7 +918,16 @@ function clearVoice(){
 }
 
 document.getElementById('voice-transcript').addEventListener('input', function(){
-  if(!_listening || _voiceMode === 'audio') _voiceFinal = this.value;
+  if(!_listening){
+    _voiceCommitted = this.value;
+    _voicePending = '';
+  }
+});
+
+document.getElementById('voice-stt-mode').addEventListener('change', function(){
+  if(this.value === 'gemini-live' && !canUseGeminiLive()){
+    setVoiceStatus('Gemini Live STT needs localhost — run: npm run dev');
+  }
 });
 
 function clampScore(v, half){
@@ -680,11 +940,47 @@ function clampScore(v, half){
 }
 
 function setSlider(k, val){
-  var el = document.querySelector('input[oninput="sv(\''+k+'\',this.value)"]');
-  if(el){ el.value = val; sv(k, val); }
+  var el = findSlider(k);
+  if(!el) return false;
+  el.value = val;
+  sv(k, val);
+  return true;
+}
+
+function normalizeParsed(d){
+  if(!d || typeof d !== 'object') return null;
+  var out = Object.assign({}, d);
+  var raw = d.sc;
+  if(!raw && d.scores) raw = d.scores;
+  if(typeof raw === 'string') { try { raw = JSON.parse(raw); } catch(e) { raw = null; } }
+  if(!raw || typeof raw !== 'object'){
+    raw = {};
+    ['health','work','mind','money','rel','growth','spirit','disc','energy','day'].forEach(function(k){
+      if(d[k] != null && d[k] !== '') raw[k] = d[k];
+    });
+  }
+  var sc = {};
+  Object.keys(raw).forEach(function(k){
+    var v = raw[k];
+    if(v != null && typeof v === 'object' && v.score != null) v = v.score;
+    if(v != null && v !== '') sc[k] = v;
+  });
+  out.sc = sc;
+  return out;
+}
+
+function parsedScoreSummary(d){
+  var s = (d && d.sc) || {};
+  var keys = ['health','work','mind','energy','day'];
+  var parts = [];
+  keys.forEach(function(k){
+    if(s[k] != null && s[k] !== '') parts.push(k + ' ' + s[k]);
+  });
+  return parts.join(' · ');
 }
 
 function applyParsedEntry(d){
+  d = normalizeParsed(d);
   if(!d) return;
   var s = d.sc || {};
   ['health','work','mind','money','rel','growth','spirit','disc','energy'].forEach(function(k){
@@ -730,13 +1026,21 @@ async function parseVoice(){
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-    var json = await res.json();
+    var raw = await res.text();
+    var json;
+    try { json = JSON.parse(raw); } catch (e) {
+      throw new Error(res.ok ? 'Invalid server response' : (raw.trim() || 'Process API not found — restart npm run dev'));
+    }
     if(!res.ok) throw new Error(json.error || 'Process failed');
-    applyParsedEntry(json.data);
+    var parsed = normalizeParsed(json.data);
+    applyParsedEntry(parsed);
     var usedModel = json.model || GEMINI_PARSE_MODEL;
     document.getElementById('voice-model').textContent = 'parse · ' + usedModel;
-    toast('Form filled — review and commit.');
-    setVoiceStatus('Done (' + usedModel + '). Scroll down, tweak, then commit.');
+    var summary = parsedScoreSummary(parsed);
+    toast(summary ? 'Filled — ' + summary : 'Form filled — review and commit.');
+    setVoiceStatus('Done (' + usedModel + '). Scores updated below — tweak, then commit.');
+    var anchor = document.getElementById('v-health');
+    if(anchor) anchor.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }catch(err){
     console.error(err);
     var msg = err.message || 'Process failed';
@@ -780,7 +1084,7 @@ async function saveLog(){
   };
   var existed = _cache.some(function(e){ return e.entry_date === dv; });
   var res = await sb.from('journal_entries').upsert(row, { onConflict: 'entry_date' });
-  if(res.error){ console.error(res.error); toast('Save failed'); return; }
+  if(res.error){ console.error(res.error); toast(supabaseErrorMsg(res.error, 'Save')); return; }
   await loadAll();
   toast(existed ? 'Day updated.' : 'Day committed.');
 }
@@ -839,7 +1143,7 @@ function importData(input){
       }).filter(Boolean);
       if(!rows.length){ toast('Nothing to import'); input.value=''; return; }
       var res = await sb.from('journal_entries').upsert(rows, { onConflict: 'entry_date' });
-      if(res.error){ console.error(res.error); toast('Import failed'); input.value=''; return; }
+      if(res.error){ console.error(res.error); toast(supabaseErrorMsg(res.error, 'Import')); input.value=''; return; }
       await loadAll();
       toast('Restored. '+_cache.length+' total entries.');
       input.value='';
@@ -854,7 +1158,7 @@ function importData(input){
 /* ── WIPE ── */
 async function wipeAll(){
   var res = await sb.from('journal_entries').delete().gte('id', 0);
-  if(res.error){ console.error(res.error); toast('Wipe failed'); return; }
+  if(res.error){ console.error(res.error); toast(supabaseErrorMsg(res.error, 'Wipe')); return; }
   _cache = [];
   location.reload();
 }
@@ -948,8 +1252,7 @@ document.getElementById('f-date').addEventListener('change', function() {
   var logs = gl(); var existing = logs.find(function(e){ return e.entry_date === dv || e.date === fDate; });
   if(existing) {
     Object.keys(sc).forEach(function(k){
-      var el = document.querySelector('input[oninput="sv(\''+k+'\',this.value)"]');
-      if(el && existing.sc[k] !== undefined) { el.value = existing.sc[k]; sv(k, existing.sc[k]); }
+      if(existing.sc[k] !== undefined) setSlider(k, existing.sc[k]);
     });
     document.getElementById('f-sleep').value = existing.sleep || '';
     document.getElementById('f-workout').value = existing.workout_type || existing.workout || '';
@@ -975,10 +1278,7 @@ document.getElementById('f-date').addEventListener('change', function() {
     document.getElementById('f-mistake').value = '';
     document.getElementById('f-fix').value = '';
     document.getElementById('f-why').value = '';
-    Object.keys(sc).forEach(function(k){
-      var el = document.querySelector('input[oninput="sv(\''+k+'\',this.value)"]');
-      if(el) { el.value = 6; sv(k, 6); }
-    });
+    Object.keys(sc).forEach(function(k){ setSlider(k, 6); });
   }
 });
 

@@ -1,0 +1,14 @@
+{
+  "name": "meta-journal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/live-stt-server.mjs",
+    "vercel:dev": "vercel dev"
+  },
+  "dependencies": {
+    "@google/genai": "^1.40.0",
+    "dotenv": "^16.4.7",
+    "ws": "^8.18.0"
+  }
+}
