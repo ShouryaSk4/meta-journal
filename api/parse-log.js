@@ -37,6 +37,9 @@ Rules:
 - "discipline" maps to sc.disc.
 - "inner self" / "spirit" / "meditation" maps to sc.spirit and possibly spirit_time.`;
 
+const AUDIO_USER_PROMPT =
+  'Listen to this voice memo about my day. Transcribe what I said, then extract the journal JSON as specified in the system instruction.';
+
 // Journal parsing model (override with GEMINI_MODEL env on Vercel / .env)
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite';
 
@@ -50,9 +53,18 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'GEMINI_API_KEY is not set on the server' });
   }
 
-  const { transcript } = req.body || {};
-  if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
-    return res.status(400).json({ error: 'transcript is required' });
+  const { transcript, audio, audioMime } = req.body || {};
+  let parts;
+
+  if (audio && typeof audio === 'string' && audio.trim()) {
+    parts = [
+      { inline_data: { mime_type: audioMime || 'audio/webm', data: audio.trim() } },
+      { text: AUDIO_USER_PROMPT },
+    ];
+  } else if (transcript && typeof transcript === 'string' && transcript.trim()) {
+    parts = [{ text: transcript.trim() }];
+  } else {
+    return res.status(400).json({ error: 'transcript or audio is required' });
   }
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
@@ -66,7 +78,7 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: [{ parts: [{ text: transcript.trim() }] }],
+        contents: [{ parts }],
         generationConfig: {
           temperature: 0.2,
           responseMimeType: 'application/json',
