@@ -178,6 +178,33 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
 
 .toast { position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 20px; font-size: 9px; font-weight: 500; letter-spacing: 0.2em; text-transform: uppercase; border-radius: 0; opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 999; }
 .toast.show { opacity: 1; }
+
+/* VOICE */
+.voice-sec { border: 1px solid var(--line); padding: 16px; margin-bottom: 28px; }
+.voice-label { font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.voice-status { display: block; font-size: 11px; color: var(--muted2); margin-top: 8px; line-height: 1.4; }
+.voice-meta { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-family: var(--mono); font-size: 9px; color: var(--muted2); letter-spacing: 0.12em; }
+.voice-lang { background: var(--bg2); border: 1px solid var(--line); color: var(--muted); font-family: var(--mono); font-size: 9px; padding: 5px 8px; cursor: pointer; }
+.voice-live { min-height: 0; font-size: 12px; font-style: italic; color: var(--muted); margin-top: 10px; line-height: 1.55; }
+.voice-live:not(:empty) { min-height: 20px; }
+.voice-meter { display: none; align-items: flex-end; gap: 3px; height: 20px; margin-top: 10px; }
+.voice-meter.active { display: flex; }
+.voice-meter span { flex: 1; background: var(--line2); height: 4px; transition: height 0.08s ease; }
+#voice-transcript { min-height: 88px; font-size: 12px; line-height: 1.55; margin-top: 10px; }
+.voice-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 12px; }
+.voice-btn {
+  padding: 12px 8px; background: none; border: 1px solid var(--line);
+  color: var(--muted); font-family: var(--mono); font-size: 9px;
+  letter-spacing: 0.18em; text-transform: uppercase; cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.2s;
+}
+.voice-btn:hover:not(:disabled) { border-color: var(--muted); color: var(--text); }
+.voice-btn-primary { border-color: var(--text); color: var(--text); }
+.voice-btn-primary:hover:not(:disabled) { background: var(--text); color: var(--bg); }
+.voice-btn.listening { border-color: var(--text); color: var(--text); }
+.voice-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+@keyframes voice-pulse { 0%,100%{ opacity:1; } 50%{ opacity:0.45; } }
+.voice-btn.listening { animation: voice-pulse 1.4s ease infinite; }
 </style>
 </head>
 <body>
@@ -190,6 +217,27 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
 <!-- LOG -->
 <div class="view active" id="view-log">
   <div class="log-header"><h1>Daily Log</h1><p>Fill once. Fill honestly.</p></div>
+
+  <div class="voice-sec" id="voice-sec">
+    <span class="voice-label">Voice log</span>
+    <span class="voice-status" id="voice-status">Tap record and talk through your whole day in one go.</span>
+    <div class="voice-meta">
+      <span id="voice-timer">00:00</span>
+      <select id="voice-lang" class="voice-lang" title="Speech recognition language">
+        <option value="en-IN" selected>English (India)</option>
+        <option value="en-US">English (US)</option>
+        <option value="en-GB">English (UK)</option>
+      </select>
+    </div>
+    <div id="voice-live" class="voice-live" aria-live="polite"></div>
+    <div class="voice-meter" id="voice-meter" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+    <textarea id="voice-transcript" placeholder="Final transcript builds here… or type / paste your day instead."></textarea>
+    <div class="voice-actions">
+      <button type="button" class="voice-btn" id="voice-mic-btn" onclick="toggleVoice()">◉ Record</button>
+      <button type="button" class="voice-btn voice-btn-primary" id="voice-parse-btn" onclick="parseVoice()">→ Process</button>
+      <button type="button" class="voice-btn" id="voice-clear-btn" onclick="clearVoice()">Clear</button>
+    </div>
+  </div>
 
   <div class="field"><label>Date</label><input type="date" id="f-date"></div>
 
@@ -364,6 +412,230 @@ function isoToDisplay(iso){
 
 function numOrNull(id){ var v=document.getElementById(id).value; return v===''?null:Number(v); }
 function strOrNull(id){ var v=document.getElementById(id).value; return v===''?null:v; }
+
+/* ── VOICE LOG ── */
+var _recognition = null;
+var _listening = false;
+var _voiceFinal = '';
+var _voiceTimerIv = null;
+var _voiceMeterIv = null;
+var _audioCtx = null;
+var _analyser = null;
+var _mediaStream = null;
+
+function setVoiceStatus(msg){ document.getElementById('voice-status').textContent = msg; }
+
+function speechSupported(){
+  return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+function bestTranscript(result){
+  var best = result[0];
+  for(var j = 1; j < result.length; j++){
+    if(result[j].confidence > best.confidence) best = result[j];
+  }
+  return best.transcript;
+}
+
+function initSpeech(){
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(!SR) return null;
+  var r = new SR();
+  r.continuous = true;
+  r.interimResults = true;
+  r.maxAlternatives = 3;
+  r.lang = document.getElementById('voice-lang').value;
+  r.onresult = function(ev){
+    var interim = '';
+    for(var i = ev.resultIndex; i < ev.results.length; i++){
+      var result = ev.results[i];
+      var t = bestTranscript(result);
+      if(result.isFinal){
+        _voiceFinal += t;
+        if(!/[.!?]$/.test(t.trim())) _voiceFinal += '. ';
+        else _voiceFinal += ' ';
+      } else interim += t;
+    }
+    document.getElementById('voice-live').textContent = interim;
+    document.getElementById('voice-transcript').value = _voiceFinal.trim();
+  };
+  r.onerror = function(ev){
+    console.error('Speech error:', ev.error);
+    if(ev.error === 'not-allowed') setVoiceStatus('Microphone blocked — allow mic access or type below.');
+    else if(ev.error === 'no-speech') setVoiceStatus('No speech heard — try again closer to the mic.');
+    else if(ev.error !== 'aborted') setVoiceStatus('Speech error: ' + ev.error);
+    if(ev.error !== 'aborted') stopVoice();
+  };
+  r.onend = function(){
+    if(_listening){
+      setTimeout(function(){
+        if(_listening) try{ r.start(); }catch(e){}
+      }, 250);
+    }
+  };
+  return r;
+}
+
+function startVoiceMeter(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+  navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+    .then(function(stream){
+      _mediaStream = stream;
+      _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      var src = _audioCtx.createMediaStreamSource(stream);
+      _analyser = _audioCtx.createAnalyser();
+      _analyser.fftSize = 64;
+      src.connect(_analyser);
+      var bars = document.querySelectorAll('#voice-meter span');
+      var data = new Uint8Array(_analyser.frequencyBinCount);
+      document.getElementById('voice-meter').classList.add('active');
+      _voiceMeterIv = setInterval(function(){
+        if(!_analyser) return;
+        _analyser.getByteFrequencyData(data);
+        for(var i = 0; i < bars.length; i++){
+          var idx = Math.floor(i * data.length / bars.length);
+          var h = Math.max(4, Math.round((data[idx] / 255) * 18));
+          bars[i].style.height = h + 'px';
+        }
+      }, 80);
+    })
+    .catch(function(){ /* meter is optional */ });
+}
+
+function stopVoiceMeter(){
+  clearInterval(_voiceMeterIv);
+  document.getElementById('voice-meter').classList.remove('active');
+  document.querySelectorAll('#voice-meter span').forEach(function(b){ b.style.height = '4px'; });
+  if(_mediaStream) _mediaStream.getTracks().forEach(function(t){ t.stop(); });
+  _mediaStream = null;
+  if(_audioCtx){ _audioCtx.close(); _audioCtx = null; }
+  _analyser = null;
+}
+
+function startVoiceTimer(){
+  var start = Date.now();
+  document.getElementById('voice-timer').textContent = '00:00';
+  clearInterval(_voiceTimerIv);
+  _voiceTimerIv = setInterval(function(){
+    var s = Math.floor((Date.now() - start) / 1000);
+    document.getElementById('voice-timer').textContent =
+      String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }, 1000);
+}
+
+function stopVoiceTimer(){
+  clearInterval(_voiceTimerIv);
+}
+
+function toggleVoice(){
+  if(_listening) stopVoice();
+  else startVoice();
+}
+
+function startVoice(){
+  if(!speechSupported()){
+    setVoiceStatus('Speech not supported in this browser — type or paste instead.');
+    toast('Use Chrome or Edge for voice');
+    return;
+  }
+  _recognition = initSpeech();
+  _voiceFinal = document.getElementById('voice-transcript').value.trim();
+  if(_voiceFinal) _voiceFinal += ' ';
+  document.getElementById('voice-live').textContent = '';
+  _listening = true;
+  var btn = document.getElementById('voice-mic-btn');
+  btn.textContent = '■ Stop';
+  btn.classList.add('listening');
+  document.getElementById('voice-lang').disabled = true;
+  setVoiceStatus('Listening… health, sleep, work scores, wins, mistakes, day score.');
+  startVoiceTimer();
+  startVoiceMeter();
+  try{ _recognition.start(); }catch(e){}
+}
+
+function stopVoice(){
+  _listening = false;
+  if(_recognition) try{ _recognition.stop(); }catch(e){}
+  stopVoiceTimer();
+  stopVoiceMeter();
+  document.getElementById('voice-live').textContent = '';
+  document.getElementById('voice-lang').disabled = false;
+  var btn = document.getElementById('voice-mic-btn');
+  btn.textContent = '◉ Record';
+  btn.classList.remove('listening');
+  setVoiceStatus('Stopped. Tap Process to fill the form.');
+}
+
+function clearVoice(){
+  if(_listening) stopVoice();
+  _voiceFinal = '';
+  document.getElementById('voice-transcript').value = '';
+  document.getElementById('voice-live').textContent = '';
+  document.getElementById('voice-timer').textContent = '00:00';
+  setVoiceStatus('Transcript cleared.');
+}
+
+function clampScore(v, half){
+  var n = parseFloat(v);
+  if(isNaN(n)) return 6;
+  n = Math.max(1, Math.min(10, n));
+  if(half) n = Math.round(n * 2) / 2;
+  else n = Math.round(n);
+  return n;
+}
+
+function setSlider(k, val){
+  var el = document.querySelector('input[oninput="sv(\''+k+'\',this.value)"]');
+  if(el){ el.value = val; sv(k, val); }
+}
+
+function applyParsedEntry(d){
+  if(!d) return;
+  var s = d.sc || {};
+  ['health','work','mind','money','rel','growth','spirit','disc','energy'].forEach(function(k){
+    if(s[k] !== undefined && s[k] !== null) setSlider(k, clampScore(s[k], false));
+  });
+  if(s.day !== undefined && s.day !== null) setSlider('day', clampScore(s.day, true));
+  if(d.sleep != null && d.sleep !== '') document.getElementById('f-sleep').value = d.sleep;
+  if(d.workout_type) document.getElementById('f-workout').value = d.workout_type;
+  if(d.workout_min != null && d.workout_min !== '') document.getElementById('f-workout-min').value = d.workout_min;
+  if(d.deep != null && d.deep !== '') document.getElementById('f-deep').value = d.deep;
+  if(d.waste != null && d.waste !== '') document.getElementById('f-waste').value = d.waste;
+  if(d.spirit_time != null && d.spirit_time !== '') document.getElementById('f-spirit-time').value = d.spirit_time;
+  if(d.output) document.getElementById('f-output').value = d.output;
+  if(d.win) document.getElementById('f-win').value = d.win;
+  if(d.mistake) document.getElementById('f-mistake').value = d.mistake;
+  if(d.fix) document.getElementById('f-fix').value = d.fix;
+  if(d.why) document.getElementById('f-why').value = d.why;
+}
+
+async function parseVoice(){
+  if(_listening) stopVoice();
+  var text = document.getElementById('voice-transcript').value.trim();
+  if(!text){ toast('Say or type something first'); return; }
+  var btn = document.getElementById('voice-parse-btn');
+  btn.disabled = true;
+  setVoiceStatus('Processing with Gemini…');
+  try{
+    var res = await fetch('/api/parse-log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transcript: text })
+    });
+    var json = await res.json();
+    if(!res.ok) throw new Error(json.error || 'Process failed');
+    applyParsedEntry(json.data);
+    toast('Form filled — review and commit.');
+    setVoiceStatus('Done. Scroll down, tweak anything, then commit.');
+  }catch(err){
+    console.error(err);
+    var msg = err.message || 'Process failed';
+    if(msg.indexOf('Failed to fetch') !== -1) msg = 'API unreachable — deploy to Vercel or run vercel dev';
+    toast(msg);
+    setVoiceStatus(msg);
+  }
+  btn.disabled = false;
+}
 
 async function show(v,btn){
   document.querySelectorAll('.view').forEach(function(e){ e.classList.remove('active'); });
@@ -563,7 +835,7 @@ document.getElementById('f-date').addEventListener('change', function() {
   var dv = this.value; if(!dv) return;
   var p=dv.split('-'); var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   var fDate = mo[parseInt(p[1],10)-1]+' '+parseInt(p[2],10)+', '+p[0];
-  var logs = gl(); var existing = logs.find(function(e){ return e.date === fDate; });
+  var logs = gl(); var existing = logs.find(function(e){ return e.entry_date === dv || e.date === fDate; });
   if(existing) {
     Object.keys(sc).forEach(function(k){
       var el = document.querySelector('input[oninput="sv(\''+k+'\',this.value)"]');
