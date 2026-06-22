@@ -301,7 +301,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.6; }
   <div class="field"><label>Day score</label><div class="srow"><span class="snum" id="v-day">6</span><input type="range" min="1" max="10" step="0.5" value="6" oninput="sv('day',this.value)"><span class="smax">/ 10</span></div></div>
   <div class="field"><label>Why this score?</label><textarea id="f-why" placeholder="Two lines. No justification needed."></textarea></div>
 
-  <button class="save-btn" onclick="saveLog()">→ Commit the day</button>
+  <button class="save-btn" id="commit-btn" onclick="saveLog()">→ Commit the day</button>
 
   <!-- BACKUP -->
   <div class="bk-label">Data Backup</div>
@@ -416,8 +416,14 @@ function toast(m){ var t=document.getElementById('toast'); t.textContent=m; t.cl
 
 function supabaseErrorMsg(err, action){
   if(!err) return action + ' failed';
-  var msg = err.message || action + ' failed';
+  var msg = err.message || String(err) || action + ' failed';
   var code = err.code || '';
+  if(/Failed to fetch|NetworkError|Network request failed|Load failed/i.test(msg)){
+    if(location.protocol === 'file:'){
+      return 'Open via http://localhost:3000 (npm run dev) — file:// blocks saves';
+    }
+    return 'Cannot reach Supabase — check internet and that the project is not paused';
+  }
   if(code === 'PGRST205' || /Could not find the table/i.test(msg)){
     return 'Table missing — run supabase_schema.sql in Supabase';
   }
@@ -443,15 +449,21 @@ function rowToEntry(r){
 }
 
 async function loadAll(){
-  var res = await sb.from('journal_entries').select('*').order('entry_date', { ascending: false });
-  if(res.error){
-    console.error('Supabase load error:', res.error);
-    toast(supabaseErrorMsg(res.error, 'Load'));
+  try{
+    var res = await sb.from('journal_entries').select('*').order('entry_date', { ascending: false });
+    if(res.error){
+      console.error('Supabase load error:', res.error);
+      toast(supabaseErrorMsg(res.error, 'Load'));
+      return false;
+    }
+    _cache = (res.data || []).map(rowToEntry);
+    _loaded = true;
+    return true;
+  }catch(err){
+    console.error('Supabase load error:', err);
+    toast(supabaseErrorMsg(err, 'Load'));
     return false;
   }
-  _cache = (res.data || []).map(rowToEntry);
-  _loaded = true;
-  return true;
 }
 
 function isoToDisplay(iso){
@@ -1044,7 +1056,11 @@ async function parseVoice(){
   }catch(err){
     console.error(err);
     var msg = err.message || 'Process failed';
-    if(msg.indexOf('Failed to fetch') !== -1) msg = 'API unreachable — deploy to Vercel or run vercel dev';
+    if(/Failed to fetch/i.test(msg)){
+      msg = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+        ? 'Process API unreachable — run npm run dev and open http://localhost:3000'
+        : 'Process API unreachable — deploy to Vercel or run npm run dev locally';
+    }
     toast(msg);
     setVoiceStatus(msg);
   }
@@ -1064,6 +1080,8 @@ async function show(v,btn){
 async function saveLog(){
   var dv=document.getElementById('f-date').value.trim();
   if(!dv){ toast('Add a date first'); return; }
+  var btn = document.getElementById('commit-btn');
+  if(btn){ btn.disabled = true; btn.textContent = 'Saving…'; }
   var fDate = isoToDisplay(dv);
   var row = {
     entry_date: dv,
@@ -1083,10 +1101,17 @@ async function saveLog(){
     why: strOrNull('f-why')
   };
   var existed = _cache.some(function(e){ return e.entry_date === dv; });
-  var res = await sb.from('journal_entries').upsert(row, { onConflict: 'entry_date' });
-  if(res.error){ console.error(res.error); toast(supabaseErrorMsg(res.error, 'Save')); return; }
-  await loadAll();
-  toast(existed ? 'Day updated.' : 'Day committed.');
+  try{
+    var res = await sb.from('journal_entries').upsert(row, { onConflict: 'entry_date' });
+    if(res.error){ console.error(res.error); toast(supabaseErrorMsg(res.error, 'Save')); return; }
+    await loadAll();
+    toast(existed ? 'Day updated.' : 'Day committed.');
+  }catch(err){
+    console.error(err);
+    toast(supabaseErrorMsg(err, 'Save'));
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '→ Commit the day'; }
+  }
 }
 
 /* ── EXPORT ── */
